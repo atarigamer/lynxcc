@@ -51,7 +51,7 @@ rebuild.
 
 | Tool | Upstream | Branch | Pinned commit | Licence | Build |
 |------|----------|--------|---------------|---------|-------|
-| `sprpck` | https://codeberg.org/42Bastian/sprpck | `master` | `b4cdc2202a` | Apache-2.0 | `EXTERN_PROGS`, sources `extern/sprpck/src/*.c`, `-DUNIX`; → `bin/sprpck` |
+| `sprpck` | https://codeberg.org/42Bastian/sprpck | `main` | `ca574db663` | Apache-2.0 | `EXTERN_PROGS`, sources `extern/sprpck/src/*.c`, `-DUNIX`; → `bin/sprpck` |
 | `lynxdir` | https://github.com/bspruck/lynxdir | `master` | `3e46f9610b` | **None declared** (all rights reserved, © 2010–2017 Björn Spruck) | `EXTERN_CXX_PROGS`, sources `extern/lynxdir/*.cpp`; → `bin/lynxdir` |
 
 ### sprpck — Lynx Sprite Packer

@@ -1,7 +1,10 @@
 # sprpck
+
+The current version has now an optimize packing algo developed with Claude (AI).
+
 ```
 -------------------------------
-Lynx Sprite Packer Ver 2.3
+Lynx Sprite Packer Ver 2.5
 (c) 1997..2021 42Bastian Schick
                Matthias  Domin
 Contributions from
@@ -46,3 +49,7 @@ PCX      => either 8 bits / 1 plane, 4bit / 1 plane or 1 bit / 4 planes
 PI1      => 1 bit / 4 planes , Atari ST Low Rez-format
 BMP      => either 8 bits or 4 bits not RLE encoded
 ```
+
+# pcx_black0.py
+
+Reorder colors in pcx to make the blackest color pen 0 (transparent pen!).

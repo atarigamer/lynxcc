@@ -68,15 +68,15 @@ Start::                                         ; Start-Label needed for reStart
                 jsr InitComLynx
                 INITBRK                         ; if we're using BRK #X, init handler
 
-                SETIRQ 2,VBL                    ; set irq-vector and enable IRQ
+//->                SETIRQ 2,VBL                    ; set irq-vector and enable IRQ
 //->                SETIRQ 0,HBL
 
 
                 cli                             ; allow interrupts
                 SCRBASE screen0                 ; set screen, single buffering
                 CLS #4                          ; clear screen with color #0
-                SETRGB pal                      ; set palette
-
+//->                SETRGB pal                      ; set palette
+		SETRGB bg24bit_pal
                 SET_MINMAX 0,0,160,102          ; screen-dim. for FONT.INC
 
 	LDAY bgSCB
@@ -90,18 +90,18 @@ loop:
 	bra	loop
 
 VBL::
-//->	dec $fda0
+	dec $fda0
                 END_IRQ
 
 HBL::
                 END_IRQ
 ****************
 bgSCB:
-	dc.b SPRCTL0_16_COL|SPRCTL0_BACKGROUND_SHADOW
+	dc.b $c1		;SPRCTL0_16_COL|SPRCTL0_BACKGROUND_SHADOW
 	dc.b SPRCTL1_DEPTH_SIZE_RELOAD
 	dc.b 0
 	dc.w 0,bg_data
-;;->	dc.w 80,51
+//->	dc.w 80,51
 	dc.w 0,0
  IF 1
 	dc.w $100,$100
@@ -131,7 +131,7 @@ clsSCB          dc.b $c0,$90,$00
                 dc.w 160*$100,102*$100          ; size_x,size_y
 cls_color       dc.b $00
 
-cls_data        dc.b 2,$10,0
+cls_data        dc.b 2,$00,0
 
 
 ****************
@@ -144,18 +144,24 @@ cls_data        dc.b 2,$10,0
                 include <includes/hexdez.inc>
                 include <includes/draw_spr.inc>
 
-//->pal:
+pal:
+
 //->	STANDARD_PAL
-//->	DP 000,842,AC8,484,E4E,FFF,446,84E,ACE,888,CC6,448,0FF,00F,773,855
-	include "/tmp/powerups_bomb.pal"
-//->	include "../pic/bg24bit.pal"
+//-> DP 000,642,800,A02,C22,6E2,26A,4AE,CAC,00E,8E4,EE6,E0E,A0E,60E,EEE
+
+//->	include "/tmp/powerups_bomb.pal"
+	include "../pic/bg24bit.pal"
+//->	;; skweek
+//->
 bg_data:
  IF 0
 	ibytes "../pack.spr"
 bg2_data:
 	ibytes "../pack_old.spr"
  ELSE
-	ibytes	"/tmp/powerups_bomb.spr"
-//->	ibytes "../pic/bg24bit.spr"
+//->	ibytes "../skweek_spr.o"
+//->	ibytes	"/tmp/powerups_bomb.spr"
+	ibytes "../pic/bg24bit.spr"
 //->	ibytes "../../BG.spr"
  ENDIF
+mor

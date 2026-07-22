@@ -61,7 +61,7 @@
    Code cleanup (more needed!)
 */
 
-#define VER "2.4"
+#define VER "2.5"
 #include "sprpck.h"
 
 int verbose;
@@ -86,7 +86,7 @@ extern BYTE* HandleOffset( BYTE * original,
 
 /* sprpck.c */
 void intobyte( int bits, BYTE val, BYTE **where );
-BYTE * packline( BYTE *in, BYTE *out, int len, int size, int optimize );
+BYTE * packline(const BYTE *in, BYTE *out, int len, int size);
 BYTE * unpackline( BYTE *in, BYTE *out, int len, int size );
 void   intobuffer( BYTE *in, BYTE *buf, int len, int size, BYTE *pColIndexes, int rev );
 int    packit( BYTE *raw, int iw, /*int  ih,*/ BYTE **spr,
@@ -94,7 +94,6 @@ int    packit( BYTE *raw, int iw, /*int  ih,*/ BYTE **spr,
                int  w, int h,
                int  act_x, int act_y,
                BYTE *pColIndexes,
-               int optimize,
                int edgePen );
 int   CountColors( BYTE *raw, int iw, int w, int h, BYTE *pColIndexes );
 int   get2val( char * s, int *a, int *b );
@@ -205,326 +204,243 @@ void intobyte( int bits, BYTE val, BYTE **where )
   }
   *where = dst;
 }
-
-typedef struct el_s {
-  int packed;
-  int start;
-  int length;
-} el_t;
-
-void dbgout( el_t *el )
+void intobyte_reset()
 {
-  if ( dbg && global_dbg ) {
-    printf( "%c%X ", el->packed ? 'P':'L', el->length-1 );
-    //->    printf("%d ",el->start);
-    fflush( stdout );
-  }
+  intobyte(0,0,NULL);
 }
 
-el_t * newEl( int packed, int pos, int length )
+/*
+ * packline() — RLE + literal packer for Lynx sprite scanlines.
+ *
+ * Input:  in   pixel array (len values, each in [0, 2^size-1])
+ *         len  number of pixels (0 excluded by caller)
+ *         size bits per pixel (1/2/3/4)
+ * Output: packed byte stream starting at `out`, MSB-first, no padding.
+ *         Returns pointer past the last written byte.
+ *
+ * Token kinds (each covers L pixels, 1<=L<=16):
+ *   Packed : header(5 bits) = L-1       (bit4=0)
+ *             value  (size bits)          repeated pixel value
+ *             cost = 5 + size  (independent of L)
+ *   Literal: header(5 bits) = 0x10|L-1  (bit4=1)
+ *             L*size bits                  raw pixels in order
+ *             cost = 5 + L*size
+ *
+ * Final byte count = floor(B/8)+1 where B = total bits across all tokens.
+ * The +1 is unconditional (even when B%8==0, one extra zero byte appended).
+ *
+ * Algorithm: backward DP over pixel positions, minimising total bit count B.
+ * Since payload_bytes = floor(B/8)+1, minimizing B is equivalent to minimizing
+ * the output byte count.  dp[p] stores (total_bits >> 3, total_bits & 7) for
+ * the optimal encoding of pixels [p .. len-1].
+ */
+
+#if 1 /* local LLM + human */
+static int is_uniform(const BYTE *p, int L)
 {
-  el_t *el;
-  el = malloc( sizeof( el_t ) );
-  if ( !el ) {
-    printf( "Out of memory!" );
-    exit( -1 );
-  }
-  el->packed = packed;
-  el->start = pos;
-  el->length = length;
-  dbgout( el );
-  return el;
+    BYTE v = *p;
+    while (--L > 0) { if (*++p != v) return 0; }
+    return 1;
 }
 
-int checkLlessP( el_t** line, int length, int size )
+/* packline                                                             */
+/* ------------------------------------------------------------------ */
+BYTE *packline(const BYTE *in, BYTE *out, int len, int size)
 {
-  int LB;
-  int B;
-  int index;
-  int l;
-  el_t* el;
-  LB = 5;
-  B = 0;
-  l = 0;
-  for ( index = 0; index < length; ++index ) {
-    el = *line++;
-    l += el->length;
-    if ( l > 16 ) {
-      break;
+  /*
+   * dp[p] = optimal total-bit cost to encode pixels [p .. len-1].
+   * We use uint32_t for the bit count so the full path sum never overflows.
+   * (worst case: 512 × (5+16*4) bits ≈ 34 KB — well within 32 bits.)
+   */
+  uint32_t dp[len + 1];
+
+  /* Choice array: what to emit at position p with which run length. */
+  struct { uint8_t tok_type; uint8_t L; } choice[len];
+  /* tok_type: 0=packed, 1=literal */
+
+  /* Base case: no pixels left => zero cost. */
+  dp[len] = 0;
+
+  /* Work backwards from the last pixel toward 0. */
+  for (int p = len - 1; p >= 0; --p) {
+    uint32_t best_bits = UINT32_MAX;
+
+    for (uint8_t L = 1; L <= 16 && p + L <= len; ++L) {
+      /* Packed token is valid only when all L pixels are identical. */
+      int packed_cost = -1;
+      if (is_uniform(in + p, L)){
+        packed_cost = 5 + size;   /* 5+size bits, independent of L */
+      }
+
+      /* Literal token is always valid. */
+      int lit_cost  = 5 + L * size;
+
+      /* Pick the cheaper token type for this run length. */
+      int cost      = lit_cost;           /* default: literal */
+      uint8_t tok   = 1;                  /* default: literal */
+
+      /* If lit_cost == packed_cost then choose literal ('00000' bug) */
+      if (packed_cost >= 0 && packed_cost < lit_cost) {
+        cost    = packed_cost;
+        tok     = 0;                  /* packed wins (tie OK — same bit cost) */
+      }
+
+      /* Total bits via this candidate = token_bits + remainder encoded by dp[p+L]. */
+      uint32_t total = (uint32_t)cost + dp[p + L];
+
+      if (total < best_bits) {
+        best_bits   = total;
+        choice[p].tok_type = tok;
+        choice[p].L        = L;
+      }
     }
-    LB += el->length * size;
-    B += ( el->packed ? 5 + size : 5 + el->length * size );
+    dp[p] = best_bits;
   }
-  return LB - B;
+
+  /* Forward pass: emit tokens according to the recorded choices. */
+  BYTE *dst  = out+1;
+
+  intobyte(0, 0, &out);
+
+  for (int p = 0; p < len; ) {
+    int     L   = choice[p].L;
+    uint8_t tok = choice[p].tok_type;
+
+    if (tok == 0) {
+      BYTE val = in[p];
+      intobyte(5, (BYTE)(L - 1), &dst);
+      intobyte(size, val , &dst);
+    } else {
+      intobyte(5, (BYTE)(0x10 | (L - 1)), &dst);
+      for (int i = 0; i < L; ++i){
+        intobyte(size, in[p + i] , &dst);
+      }
+    }
+    p += L;  /* skip to next chunk */
+  }
+  /* End of line: flush partial byte via the terminator call. */
+  intobyte(8, 0, &dst);
+  *out = (BYTE)(dst-out);
+  return dst;
 }
+
+#else /* Claude Sonnet 5 */
 /*
   pack one line either to the left or right
 */
-int line = 0;
-BYTE * packline( BYTE *in,     /* src  */
-                 BYTE *out,     /* dest.*/
-                 int len,       /* size of buffer */
-                 int size,      /* bits/pel */
-                 int optimize )
+/*
+  Optimaler Ersatz fuer packline() aus sprpck.c
+
+  Ansatz: Shortest-Path-DP ueber die Pixelpositionen der Zeile.
+  Kostenmodell (identisch zum Original-Bitstream-Format):
+
+  Pack-Token    : 5 + size        Bit, deckt 1..16 identische Pixel
+  Literal-Token : 5 + L*size      Bit, deckt 1..16 beliebige Pixel
+
+  dp[i] = minimale Bitkosten zur Kodierung von in[0..i)
+  Kanten von i nach i+L:
+  - Literal, L = 1..min(16, len-i)                (immer moeglich)
+  - Pack,    L = 1..(Laenge des konstanten Laufs)  (nur wenn in[i..i+L) konstant)
+
+  Komplexitaet: O(16 * len) -> fuer len <= 512 trivial schnell.
+  Liefert garantiert die bitminimale Token-Sequenz fuer dieses
+  Format (kein Heuristik-Rest-Risiko, keine Rundenzahl mehr noetig).
+
+  Voraussetzung: intobyte() wie im Original vorhanden/extern deklariert.
+  "optimize" wird aus Kompatibilitaetsgruenden im Prototyp behalten,
+  aber nicht mehr ausgewertet -- die DP ist immer optimal, ein
+  Deaktivieren "spart" nichts mehr, sondern würde nur verschlechtern.
+*/
+
+#include <limits.h>
+
+extern void intobyte( int bits, BYTE val, BYTE **where );
+
+BYTE * packline(BYTE *in, BYTE *out, int len, int size )
 {
-  BYTE *out0;                 /* to save the dest.        */
-  int counter;
-  int index;
-  el_t *pass1[512];
-  el_t *pass2[512];
-  el_t *save[512];
-  el_t **currPass;
-  el_t **nextPass;
-  el_t *el;
-  el_t *last_L;
-  el_t **tmp;
-  int stacksize;
-  int sp;
-  int n_save;
-  int pos;
-  int start;
-  int bits;
-  int min_bits;
-  memset( pass1, 0, sizeof( pass1 ) );
-  memset( pass2, 0, sizeof( pass2 ) );
-  memset( save, 0, sizeof( save ) );
-  out0  = out++;               /* save dest. ptr           */
-  *out0 = 0;                   /* set byte count to zero   */
+  BYTE *out0 = out++;
+  *out0 = 0;
+
   if ( len == 0 ) {
     return out0;
   }
-  intobyte( 0, 0, &out );      /* init.                    */
-  //->  printf("Line:%d\n",line++);
-  //->  dbg = 0;
-  BYTE last = 0xf;
-  /* initial pack loop */
-  index = 0;
-  pos = 0;
-  start = 0;
-  counter = 0;
-  last = in[0];
-  do {
-    counter = 1;
-    start = index;
-    last = in[index];
-    ++index;
-    if ( index < len && last == in[index] ) {
-      do {
-        ++counter;
-        ++index;
-      } while ( index < len && last == in[index] );
-      while ( counter >= 16 ) {
-        pass1[pos++] = newEl( 1, start, 16 );
-        start += 16;
-        counter -= 16;
-      }
-      if ( counter > 1 ) {
-        pass1[pos++] = newEl( 1, start, counter );
-        start += counter;
-      } else if ( counter == 1 ) {
-        --index;
-      }
-    } else {
-      do {
-        last = in[index];
-        ++counter;
-        ++index;
-      } while ( index < len && last != in[index] );
-      if ( len != index ) {
-        --index;
-        --counter;
-      }
-      while ( counter >= 16 ) {
-        pass1[pos++] = newEl( 0, start, 16 );
-        start += 16;
-        counter -= 16;
-      }
-      if ( counter > 0 ) {
-        pass1[pos++] = newEl( 0, start, counter );
-        start += counter;
-        counter = 1;
+
+  intobyte( 0, 0, &out );      /* init, wie im Original */
+
+  /* 514 passend zu den vorhandenen buffer[514]-Deklarationen im Projekt */
+  static int   dp[514];
+  static short tok_len[514];
+  static char  tok_packed[514];
+
+  int i, L, maxL, cost, pl;
+
+  dp[0] = 0;
+  for ( i = 1; i <= len; ++i ) {
+    dp[i] = INT_MAX;
+  }
+
+  for ( i = 0; i < len; ++i ) {
+    if ( dp[i] == INT_MAX ) {
+      continue;   /* unerreichbar -- kann bei diesem Kantenmodell nicht passieren,
+                     bleibt als Sicherheitsnetz drin */
+    }
+
+    /* --- Literal-Kanten: Laenge 1..16, immer erlaubt --- */
+    maxL = ( len - i < 16 ) ? ( len - i ) : 16;
+    for ( L = 1; L <= maxL; ++L ) {
+      cost = dp[i] + 5 + L * size;
+      if ( cost < dp[i+L] ) {
+        dp[i+L]         = cost;
+        tok_len[i+L]     = (short)L;
+        tok_packed[i+L]  = 0;
       }
     }
-  } while ( index < len );
-  bits = 0;
-  for ( int i = 0; i < pos; ++i ) {
-    if ( pass1[i]->packed ) {
-      bits += 5+size;
-    } else {
-      bits += 5+pass1[i]->length*size;
+
+    /* --- Pack-Kanten: nur innerhalb eines konstanten Laufs --- */
+    L = 1;
+    while ( i + L < len && in[i+L] == in[i] && L < 16 ) {
+      ++L;
+    }
+    for ( pl = 1; pl <= L; ++pl ) {
+      cost = dp[i] + 5 + size;
+      if ( cost < dp[i+pl] ) {
+        dp[i+pl]         = cost;
+        tok_len[i+pl]    = (short)pl;
+        tok_packed[i+pl] = 1;
+      }
     }
   }
-  if ( dbg && global_dbg ) {
-    printf( ": %d(%d)\n", bits, ( bits+7 )/8 );
+
+  /* --- Backtracking: Kette der gewaehlten Tokens von len nach 0 --- */
+  int pos_stack[514];
+  int n = 0;
+  for ( i = len; i > 0; i -= tok_len[i] ) {
+    pos_stack[n++] = i;
   }
-  currPass = pass1;
-  int plimit[4] = { 6, 5, 4, 3 };
-  int limit = plimit[size - 1];
-  if ( optimize ) {
-    nextPass = pass2;
-    dbg = 1;
-    bits = 0;
-    int round = 0;
-    do {
-      stacksize = pos;
-      min_bits = bits;
-      pos = 0;
-      n_save = 0;
-      last_L = NULL;
-      int save_length = 0;
-      int LB = 5;
-      int B = 0;
-      int length = 0;
-      int saved_low = -1;
-      n_save = -1;
-      for ( sp = 0; sp < stacksize; ) {
-        length = 0;
-        n_save = sp;
-        do {
-          el = currPass[sp];
-          if ( el->length >= 16 ) {
-            break;
-          }
-          if ( el->packed && el->length >= plimit[size-1] ) {
-            break;
-          }
-          length += el->length;
-          ++sp;
-        } while ( sp < stacksize && length < 32 );
-        if ( n_save == sp ) {
-          nextPass[pos++] = el;
-          dbgout( el );
-          ++sp;
-          continue;
-        }
-        if ( sp - n_save == 1 ) {
-          nextPass[pos++] = currPass[n_save];
-          dbgout( currPass[n_save] );
-          sp = n_save + 1;
-          continue;
-        }
-        int diff0 = checkLlessP( &currPass[n_save], sp - n_save, size );
-        int diff;
-        int x;
-        int n_save0 = n_save;
-        int best_diff = diff0;
-        do {
-          x = sp;
-          while ( x - n_save > 1 ) {
-            diff = checkLlessP( &currPass[n_save], x - n_save, size );
-            if ( diff < diff0 ) {
-              diff0 = diff;
-              sp = x;
-            }
-            --x;
-          }
-          x = n_save;
-          while ( sp - x > 1 ) {
-            diff = checkLlessP( &currPass[x + 1], sp - x - 1, size );
-            if ( diff < diff0 ) {
-              diff0 = diff;
-              n_save = x + 1;
-            }
-            ++x;
-          }
-          if ( diff0 >= best_diff ) {
-            break;
-          }
-          best_diff = diff0;
-        } while ( 1 );
-        if ( diff0 >= 0 ) {
-          while ( n_save0 < sp ) {
-            nextPass[pos++] = currPass[n_save0];
-            dbgout( currPass[n_save0] );
-            ++n_save0;
-          }
-        } else {
-          while ( n_save0 < n_save ) {
-            nextPass[pos++] = currPass[n_save0];
-            dbgout( currPass[n_save0] );
-            ++n_save0;
-          }
-          if ( n_save < sp ) {
-            length = 0;
-            int start = currPass[n_save]->start;
-            while ( n_save < sp ) {
-              if ( length + currPass[n_save]->length >= 16 ) {
-                if ( length + currPass[n_save]->length == 16 ) {
-                  length = 16;
-                  ++n_save;
-                }
-                el = newEl( 0, start, length );
-                nextPass[pos++] = el;
-                length = 0;
-                sp = n_save;
-              } else {
-                length += currPass[n_save]->length;
-                ++n_save;
-              }
-            }
-            if ( length ) {
-              el = newEl( 0, start, length );
-              nextPass[pos++] = el;
-            }
-          }
-        }
-      }
-      bits = 0;
-      for ( int i = 0; i < pos; ++i ) {
-        if ( nextPass[i]->packed ) {
-          bits += 5+size;
-        } else {
-          bits += 5+nextPass[i]->length*size;
-        }
-      }
-      if ( dbg && global_dbg ) {
-        printf( ": %d(%d)\n", bits, ( bits+7 )/8 );
-      }
-      //if (bits > min_bits) break;
-      tmp = currPass;
-      currPass = nextPass;
-      nextPass = tmp;
-      ++round;
-    } while ( round < 4 /* bits < min_bits */ );
-  }
-  //->  dbg = 0;
-  if ( dbg && global_dbg ) {
-    printf( "---------------------\n" );
-    stacksize = pos;
-    for ( sp = 0; sp < stacksize; ++sp ) {
-      el = currPass[sp];
-      dbgout( el );
-    }
-    printf( "\n---------------------\n" );
-  }
-  //->  dbg = 0;
-  stacksize = pos;
-  bits = 0;
-  for ( sp = 0; sp < stacksize; ++sp ) {
-    int start;
-    el = currPass[sp];
-    dbgout( el );
-    start = el->start;
-    if ( el->packed ) {
-      intobyte( 5, el->length-1, &out );
+
+  /* --- Ausgabe in Vorwaertsreihenfolge, identischer Bitstream wie Original --- */
+  int start = 0;
+  for ( int k = n - 1; k >= 0; --k ) {
+    int end = pos_stack[k];
+    int l   = tok_len[end];
+
+    if ( tok_packed[end] ) {
+      intobyte( 5, l - 1, &out );
       intobyte( size, in[start], &out );
-      bits += 5+size;
     } else {
-      intobyte( 5, 0x10|( el->length-1 ), &out );
-      for ( int i = 0; i < el->length; ++i ) {
-        intobyte( size, in[start+i], &out );
+      intobyte( 5, 0x10 | ( l - 1 ), &out );
+      for ( int j = 0; j < l; ++j ) {
+        intobyte( size, in[start+j], &out );
       }
-      bits += 5+el->length*size;
     }
+    start = end;
   }
-  intobyte( 8, 0, &out ); /* Set end mark */
+
+  intobyte( 8, 0, &out );   /* Ende-Markierung, wie im Original */
   *out0 = ( BYTE )( out - out0 );
-  if ( dbg && global_dbg ) {
-    printf( ": %d(%d,%d)\n\n", bits, ( bits+7 )/8, *out0 );
-  }
   return out;
 }
-
+#endif
 /*
   pack the raw data into a literal sprite line
 */
@@ -590,7 +506,6 @@ int packit( BYTE *raw, /* input data     */
             int  act_x,
             int  act_y,   /*   action point */
             BYTE  * pColIndexes,
-            int optimize,
             int edgePen )
 
 {
@@ -607,7 +522,7 @@ int packit( BYTE *raw, /* input data     */
     intobuffer( raw+( y*iw )+act_x, buffer, width, size, pColIndexes, 0 );
     width = findEdge( buffer, width, edgePen );
     if ( packed ) {
-      spr0 = packline( buffer, spr0, width, size, optimize );
+      spr0 = packline( buffer, spr0, width, size );
     } else {
       spr0 = unpackline( buffer, spr0, width, size );
     }
@@ -620,7 +535,7 @@ int packit( BYTE *raw, /* input data     */
       intobuffer( raw+( y*iw )+act_x, buffer, width, size, pColIndexes, 0 );
       width = findEdge( buffer, width, edgePen );
       if ( packed ) {
-        spr0 = packline( buffer, spr0, width, size, optimize );
+        spr0 = packline( buffer, spr0, width, size);
       } else {
         spr0 = unpackline( buffer, spr0, width, size );
       }
@@ -633,7 +548,7 @@ int packit( BYTE *raw, /* input data     */
         intobuffer( raw+( y*iw ), buffer, width, size, pColIndexes, 1 );
         width = findEdge( buffer, width, edgePen );
         if ( packed ) {
-          spr0 = packline( buffer, spr0, width, size, optimize );
+          spr0 = packline( buffer, spr0, width, size);
         } else {
           spr0 = unpackline( buffer, spr0, width, size );
         }
@@ -645,7 +560,7 @@ int packit( BYTE *raw, /* input data     */
         intobuffer( raw+( y*iw ), buffer, width, size, pColIndexes, 1 );
         width = findEdge( buffer, width, edgePen );
         if ( packed ) {
-          spr0 = packline( buffer, spr0, width, size, optimize );
+          spr0 = packline( buffer, spr0, width, size);
         } else {
           spr0 = unpackline( buffer, spr0, width, size );
         }
@@ -753,7 +668,6 @@ int main( int argc, char *argv[] )
   int orgoff_x; // orgoff_y;
   int org_ww, org_hh;
   int nColorsUsed;
-  int optimize;
   int edgePen;
   /* end of var. decl. */
   global_dbg = 0;
@@ -773,7 +687,6 @@ int main( int argc, char *argv[] )
             "[-rxxxyyy] [-z] in [out]\n"
             "or\n"
             "sprpck batchfile\n"
-            "-O0      : do no optimize literal/packed\n"
             "-e<pen>  : compress until color is only <pen>\n"
             "-c       : compress color index\n"
             "-v       : don't be quiet\n"
@@ -803,7 +716,7 @@ int main( int argc, char *argv[] )
             "PCX      => either 8 bits / 1 plane, 4bit / 1 plane or 1 bit / 4 planes\n"
             "PI1      => 1 bit / 4 planes , Atari ST Low Rez-format\n"
             "BMP      => either 8 bits or 4 bits not RLE encoded\n"
-          );
+            );
     exit( 0 );
   }
   --argc;
@@ -830,7 +743,6 @@ int main( int argc, char *argv[] )
     type     = TYPE_PCX;
     sort_colindex = 0;
     pal_output = LYXASS_SRC;
-    optimize = 1;
     edgePen = -1;
 #ifdef DEBUG
     verbose = 1;
@@ -880,15 +792,6 @@ int main( int argc, char *argv[] )
             if ( verbose ) {
               printf( "Edge-Pen = %d\n", edgePen );
             }
-          }
-        }
-        break;
-      case 'O':
-        err = sscanf( c_ptr+2, "%d", &val );
-        if ( err ) {
-          optimize = ( val != 0 );
-          if ( verbose ) {
-            printf( "%sable optimization!\n", optimize ? "En" : "Dis" );
           }
         }
         break;
@@ -1118,7 +1021,7 @@ int main( int argc, char *argv[] )
         // now pack the sprite
         //
         ret = packit( raw, in_w,/*in_h,*/ &out, size, packed,
-                      w, h, action_x, action_y, bColIndexes, optimize, edgePen );
+                      w, h, action_x, action_y, bColIndexes, edgePen );
         free( raw ); // no need for this anymore
         if ( ret ) {
           if ( tiles == 1 ) // Only once
